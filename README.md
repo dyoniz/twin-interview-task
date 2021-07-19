@@ -5,7 +5,5 @@ Python dev job interview task for TWIN
 ## Usage
 
 ```Bash
-python3 twin_bot.py path-to-dialogs-folder
+python3 twin_bot.py path-to-dialogs-folder > out.json
 ```
-
-Result is printed to the standard output
