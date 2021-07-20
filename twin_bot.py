@@ -102,7 +102,7 @@ class IntentParser:
                         sleep_sec = IntentParser._get_sleep_time(attempt)
                         print(
                             f"Too many requests, attempt={attempt + 1}, "
-                            + "sleeping {round(sleep_sec, 2)} sec"
+                            + f"sleeping {round(sleep_sec, 2)} sec"
                         )
                         await asyncio.sleep(sleep_sec)
                         continue
