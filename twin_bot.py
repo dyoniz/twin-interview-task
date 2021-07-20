@@ -19,6 +19,7 @@ TWIN_PARSE_URL = "https://sandbox.twin24.ai/parse"
 HTTP_STATUS_TOO_MANY_REQUESTS = 429
 HTTP_STATUS_OK = 200
 MAX_REQUEST_ATTEMPTS = 5
+REQUEST_BATCH_SIZE = 20
 
 
 Message = namedtuple("Message", "is_bot, text")
@@ -50,13 +51,20 @@ class IntentParser:
             if phrase in self._intents_by_phrase_cache:
                 continue
             new_phrases.append(phrase)
+
         phrases = new_phrases
 
-        parse_phrase_coroutines = []
+        requests = []
         for phrase in phrases:
-            parse_phrase_coroutines.append(self._parse_phrase_retry(phrase))
+            requests.append(self._parse_phrase_retry(phrase))
 
-        intents = await asyncio.gather(*parse_phrase_coroutines)
+        intents = []
+        start = 0
+        while start < len(requests):
+            end = start + REQUEST_BATCH_SIZE
+            intents.extend(await asyncio.gather(*requests[start:end]))
+            start += REQUEST_BATCH_SIZE
+
         assert len(phrases) == len(intents)
         for phrase, intent in zip(phrases, intents):
             self._intents_by_phrase_cache[phrase] = intent
