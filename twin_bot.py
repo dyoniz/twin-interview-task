@@ -7,37 +7,89 @@ import sys
 import os
 import json
 import glob
-from collections import OrderedDict
+from collections import namedtuple, OrderedDict
+import random
+import typing as tp
+
 import asyncio
 import aiohttp
 
 
 TWIN_PARSE_URL = "https://sandbox.twin24.ai/parse"
-DEFAULT_INTENT = "default"
 HTTP_STATUS_TOO_MANY_REQUESTS = 429
 HTTP_STATUS_OK = 200
-MAX_ATTEMPTS = 10
+MAX_REQUEST_ATTEMPTS = 5
+
+
+Message = namedtuple("Message", "is_bot, text")
 
 
 class HttpError(Exception):
     """ Http error """
 
 
-class Message:
-    """ A message in a dialog """
+class IntentParser:
+    def __init__(self, parse_api_url: str):
+        self._parse_api_url = parse_api_url
+        self._intents_by_phrase_cache: dict[str, str] = {}
 
-    # pylint: disable=too-few-public-methods
+    async def parse_phrases(self, phrases: tp.Iterable[str]):
+        """
+        @return: intent by phrase dictionary
+        """
+        for phrase in phrases:
+            if phrase is None:
+                continue
+            phrase = phrase.strip()
+            if not phrase:
+                continue
+            if phrase not in self._intents_by_phrase_cache:
+                self._intents_by_phrase_cache[phrase] = await self._parse_phrase_retry(
+                    phrase
+                )
 
-    def __init__(self, text: str, is_bot: bool):
-        self.text = text
-        self.is_bot = is_bot
-        self.intent = None
+    def get_intent(self, phrase: str) -> tp.Optional[str]:
+        """
+        Get intent by phrase or None if phrase was not parsed
+        To parse phrases call parse_phrases
+        """
+        if phrase is None:
+            return None
+        phrase = phrase.strip()
+        if not phrase:
+            return None
+        return self._intents_by_phrase_cache.get(phrase, None)
 
-    def __repr__(self) -> str:
-        return "%s: %s%s" % (
-            "Bot: " if self.is_bot else "Human: ",
-            (self.intent + ": ") if not self.is_bot else "",
-            self.text,
+    @staticmethod
+    def _get_sleep_time(attempt: int):
+        assert attempt >= 0
+        return attempt / 2 + random.random()
+
+    async def _parse_phrase_retry(self, phrase: str) -> str:
+        """
+        @return: intent
+        """
+        assert phrase
+        params = {"q": phrase}
+        for attempt in range(MAX_REQUEST_ATTEMPTS):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self._parse_api_url, params=params) as resp:
+                    if resp.status == HTTP_STATUS_OK:
+                        resp_json = await resp.json()
+                        return resp_json["intent"]["name"]
+                    if resp.status == HTTP_STATUS_TOO_MANY_REQUESTS:
+                        sleep_sec = IntentParser._get_sleep_time(attempt)
+                        print(
+                            f"Too many requests, attempt={attempt + 1}, "
+                            + "sleeping {round(sleep_sec, 2)} sec"
+                        )
+                        await asyncio.sleep(sleep_sec)
+                        continue
+                    raise HttpError(
+                        f"Failed to get intent. Server returned {resp.status}"
+                    )
+        raise TimeoutError(
+            f"Failed to get response from server after {MAX_REQUEST_ATTEMPTS} attempts"
         )
 
 
@@ -48,21 +100,26 @@ class DialogTreeNode:
         self.is_bot: bool = True
         self.intent: str = None
         self.phrases: set[str] = set()
-        # replies by intent
-        self.replies: dict[str, DialogTreeNode] = {}
+        self.replies_by_intent: dict[str, DialogTreeNode] = {}
 
-    def add_reply(self, message: Message):
-        if message.intent in self.replies:
-            next_node = self.replies[message.intent]
-            assert next_node.is_bot == message.is_bot
-            assert next_node.intent == message.intent
+    def add_reply(self, is_bot: bool, phrase: str, intent: str):
+        if is_bot:
+            assert intent is None
+        else:
+            assert intent is not None
+        assert phrase
+
+        if intent in self.replies_by_intent:
+            next_node = self.replies_by_intent[intent]
+            assert next_node.is_bot == is_bot
+            assert next_node.intent == intent
         else:
             next_node = DialogTreeNode()
-            next_node.is_bot = message.is_bot
-            next_node.intent = message.intent
-            self.replies[message.intent] = next_node
+            next_node.is_bot = is_bot
+            next_node.intent = intent
+            self.replies_by_intent[intent] = next_node
 
-        next_node.phrases.add(message.text)
+        next_node.phrases.add(phrase)
 
         return next_node
 
@@ -74,78 +131,61 @@ class DialogTreeNode:
         return not self.phrases
 
 
-def encode_dialog_tree(node: DialogTreeNode):
-    if not isinstance(node, DialogTreeNode):
-        raise TypeError("%r is not JSON serializable" % (node,))
-    if node.is_empty:
-        return {}
-    assert node.is_bot or node.intent is not None, node
-    result = OrderedDict()
-    if node.intent is not None:
-        result["intent"] = node.intent
-    result["is_bot"] = node.is_bot
-    result["phrases"] = list(node.phrases)
-    result["replies"] = list(node.replies.values())
-    return result
+class DialogTree(DialogTreeNode):
+    def __init__(self):
+        super().__init__()
+        self.is_bot = True
+        self.intent = None
+
+    def add_dialog(
+        self,
+        messages: tp.Iterable[Message],
+        get_intent: tp.Callable[[str], tp.Optional[str]],
+    ):
+        if not messages:
+            return
+
+        if not messages[0].is_bot:
+            messages = messages[1:]
+            if not messages:
+                return
+
+        assert messages[0].is_bot
+
+        self.phrases.add(messages[0].text)
+
+        next_node = self
+        for is_bot, phrase in messages[1:]:
+            intent = get_intent(phrase) if not is_bot else None
+            assert is_bot or intent is not None, phrase
+            next_node = next_node.add_reply(is_bot, phrase, intent)
+
+    @staticmethod
+    def encode_json(node: DialogTreeNode):
+        if not isinstance(node, DialogTreeNode):
+            raise TypeError("%r is not JSON serializable" % (node,))
+        if node.is_empty:
+            return {}
+        assert node.is_bot or node.intent is not None, node
+        result = OrderedDict()
+        if node.intent is not None:
+            result["intent"] = node.intent
+        result["is_bot"] = node.is_bot
+        result["phrases"] = list(node.phrases)
+        result["replies"] = list(node.replies_by_intent.values())
+        return result
 
 
-def read_messages(dialog_filename: str) -> list[Message]:
+def read_dialog_file(json_filename: str) -> list[Message]:
     """
     Read messages from the dialog file
     @return: list of Message objects (without intent)
     """
-    with open(dialog_filename, encoding="utf8") as dialog_json:
-        return [Message(msg["text"], msg["is_bot"]) for msg in json.load(dialog_json)]
-
-
-async def get_intent(text: str):
-    text = text.strip()
-    if not text:
-        return DEFAULT_INTENT
-    params = {"q": text}
-    for _ in range(MAX_ATTEMPTS):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(TWIN_PARSE_URL, params=params) as resp:
-                if resp.status == HTTP_STATUS_OK:
-                    resp_json = await resp.json()
-                    return resp_json["intent"]["name"]
-                if resp.status == HTTP_STATUS_TOO_MANY_REQUESTS:
-                    await asyncio.sleep(1)
-                    continue
-                raise HttpError(f"Failed to get intent. Server returned {resp.status}")
-    raise TimeoutError("Failed to get intent due to throttling")
-
-
-async def request_intents(messages: list[Message]):
-    # We could request intents in parallel and then use asyncio.gather(),
-    # but this would be an overkill for this little task,
-    # so we simply requesting intents in a single loop one by one
-    for message in messages:
-        if not message.is_bot:
-            message.intent = await get_intent(message.text)
-        else:
-            message.intent = None
-
-
-def update_dialog_tree(node: DialogTreeNode, messages: list[Message]):
-    assert node.is_bot
-    assert node.intent is None
-    if not messages:
-        return
-
-    if not messages[0].is_bot:
-        messages = messages[1:]
-        if not messages:
-            return
-
-    assert messages[0].is_bot
-    assert messages[0].intent is None
-
-    node.phrases.add(messages[0].text)
-
-    for message in messages[1:]:
-        next_node = node.add_reply(message)
-        node = next_node
+    with open(json_filename, encoding="utf8") as dialog_json:
+        return [
+            Message(is_bot=msg["is_bot"], text=msg["text"])
+            for msg in json.load(dialog_json)
+        ]
 
 
 async def main():
@@ -167,13 +207,16 @@ async def main():
         print(f"Couldn't find any json files with dialogs in folder {dialogs_folder}")
         sys.exit(1)
 
-    dialog_tree = DialogTreeNode()
+    intent_parser = IntentParser(TWIN_PARSE_URL)
+    dialog_tree = DialogTree()
 
     for dialog_filename in dialog_filenames:
         try:
-            messages = read_messages(dialog_filename)
-            await request_intents(messages)
-            update_dialog_tree(dialog_tree, messages)
+            messages = read_dialog_file(dialog_filename)
+            await intent_parser.parse_phrases(
+                [text for is_bot, text in messages if not is_bot]
+            )
+            dialog_tree.add_dialog(messages, intent_parser.get_intent)
         except HttpError as ex:
             print(f"Failed to add dialog to the tree: {dialog_filename}")
             print(ex)
@@ -181,7 +224,7 @@ async def main():
 
     print(
         json.dumps(
-            dialog_tree, default=encode_dialog_tree, indent=4, ensure_ascii=False
+            dialog_tree, default=DialogTree.encode_json, indent=4, ensure_ascii=False
         )
     )
 
