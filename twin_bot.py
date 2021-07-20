@@ -10,6 +10,7 @@ import glob
 from collections import namedtuple, OrderedDict
 import random
 import typing as tp
+import logging
 
 import asyncio
 import aiohttp
@@ -23,6 +24,8 @@ REQUEST_BATCH_SIZE = 20
 
 
 Message = namedtuple("Message", "is_bot, text")
+
+log = logging.getLogger("twin_bot")
 
 
 class HttpError(Exception):
@@ -100,7 +103,7 @@ class IntentParser:
                         return resp_json["intent"]["name"]
                     if resp.status == HTTP_STATUS_TOO_MANY_REQUESTS:
                         sleep_sec = IntentParser._get_sleep_time(attempt)
-                        print(
+                        logging.debug(
                             f"Too many requests, attempt={attempt + 1}, "
                             + f"sleeping {round(sleep_sec, 2)} sec"
                         )
@@ -241,6 +244,7 @@ async def main():
         except HttpError as ex:
             print(f"Failed to add dialog to the tree: {dialog_filename}")
             print(ex)
+            log.exception(ex)
             continue
 
     print(
