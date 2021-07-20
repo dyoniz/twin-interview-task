@@ -37,16 +37,29 @@ class IntentParser:
         """
         @return: intent by phrase dictionary
         """
+
+        if not phrases:
+            return
+
+        new_phrases = []
         for phrase in phrases:
-            if phrase is None:
-                continue
+            assert phrase is not None
             phrase = phrase.strip()
             if not phrase:
                 continue
-            if phrase not in self._intents_by_phrase_cache:
-                self._intents_by_phrase_cache[phrase] = await self._parse_phrase_retry(
-                    phrase
-                )
+            if phrase in self._intents_by_phrase_cache:
+                continue
+            new_phrases.append(phrase)
+        phrases = new_phrases
+
+        parse_phrase_coroutines = []
+        for phrase in phrases:
+            parse_phrase_coroutines.append(self._parse_phrase_retry(phrase))
+
+        intents = await asyncio.gather(*parse_phrase_coroutines)
+        assert len(phrases) == len(intents)
+        for phrase, intent in zip(phrases, intents):
+            self._intents_by_phrase_cache[phrase] = intent
 
     def get_intent(self, phrase: str) -> tp.Optional[str]:
         """
